@@ -27,29 +27,24 @@
  * Each request gets its own session (no cross-request state leakage). For
  * multi-turn conversations, clients can pass X-GuiltySpark-Session-Id header
  * to reuse an existing session and get consistent substitutions across turns.
+ *
+ * When confirm_mode is enabled in config, entities with confidence between
+ * warn_threshold and redact_threshold are held for manual review in the
+ * dashboard before the request is forwarded.
  */
 
 import { createServer as createHttpServer, IncomingMessage, ServerResponse } from 'http';
+import { randomUUID } from 'crypto';
 import { loadConfig, toProtectionConfig } from './config.js';
-import { createSubstitutionMap } from './substitution-map.js';
+import { getOrCreateSession, setDefaultTimeout } from './session-registry.js';
+import { allEntries } from './substitution-map.js';
 import { scanText } from './pii-scanner.js';
 import { applySubstitutions } from './substitution-engine.js';
 import { decodeResponse } from './response-decoder.js';
-import type { SubstitutionMap } from './types.js';
-
-// ─── Session registry ──────────────────────────────────────────────────────────
-
-const sessions = new Map<string, SubstitutionMap>();
-
-function getOrCreateSession(sessionId?: string, timeoutMs = 3_600_000): SubstitutionMap {
-  if (sessionId && sessions.has(sessionId)) {
-    return sessions.get(sessionId)!;
-  }
-  const map = createSubstitutionMap(sessionId);
-  sessions.set(map.sessionId, map);
-  setTimeout(() => sessions.delete(map.sessionId), timeoutMs);
-  return map;
-}
+import { gsEvents, GS_EVENTS } from './events.js';
+import { addAuditEntry } from './audit-log.js';
+import { createPendingReview } from './pending-queue.js';
+import type { DetectedEntity, SubstitutionMap } from './types.js';
 
 // ─── Body parsing ──────────────────────────────────────────────────────────────
 
@@ -64,10 +59,6 @@ async function readBody(req: IncomingMessage): Promise<string> {
 
 // ─── Text extraction helpers ───────────────────────────────────────────────────
 
-/**
- * Extract all user-facing text strings from an OpenAI-format request body.
- * Returns an array of [text, setter] pairs where setter writes back the sanitized text.
- */
 function extractOpenAITexts(body: Record<string, unknown>): Array<{ text: string; index: number }> {
   const messages = body.messages as Array<{ role: string; content: unknown }> | undefined;
   if (!Array.isArray(messages)) return [];
@@ -77,7 +68,6 @@ function extractOpenAITexts(body: Record<string, unknown>): Array<{ text: string
     if (typeof msg.content === 'string') {
       spans.push({ text: msg.content, index: i });
     }
-    // content can also be an array of parts (vision API) — only handle text parts
     if (Array.isArray(msg.content)) {
       msg.content.forEach((part: unknown) => {
         if (typeof part === 'object' && part !== null && (part as { type: string }).type === 'text') {
@@ -89,10 +79,6 @@ function extractOpenAITexts(body: Record<string, unknown>): Array<{ text: string
   return spans;
 }
 
-/**
- * Apply substitutions back into the message array in-place.
- * Returns a new body with all message content sanitized.
- */
 function substituteOpenAIBody(
   body: Record<string, unknown>,
   substituted: Map<number, string>,
@@ -106,10 +92,6 @@ function substituteOpenAIBody(
   return { ...body, messages };
 }
 
-/**
- * Extract texts from an Anthropic-format request body.
- * Anthropic uses { messages: [{ role, content: string | ContentBlock[] }], system?: string }
- */
 function extractAnthropicTexts(body: Record<string, unknown>): Array<{ text: string; key: string }> {
   const spans: Array<{ text: string; key: string }> = [];
 
@@ -216,12 +198,84 @@ async function forwardRequest(
   return { status: resp.status, headers: respHeaders, body: respBody };
 }
 
+// ─── Event helpers ─────────────────────────────────────────────────────────────
+
+function emitEntityEvents(
+  entities: DetectedEntity[],
+  sessionId: string,
+  requestId: string,
+  session: SubstitutionMap,
+  beforeSize: number,
+): void {
+  const afterEntries = allEntries(session);
+  const newEntryIds = new Set(afterEntries.slice(beforeSize).map(e => e.id));
+
+  for (const entity of entities) {
+    gsEvents.emit(GS_EVENTS.ENTITY_DETECTED, {
+      sessionId,
+      requestId,
+      timestamp: Date.now(),
+      entity,
+    });
+  }
+
+  for (const entry of afterEntries) {
+    gsEvents.emit(GS_EVENTS.SUBSTITUTION_APPLIED, {
+      sessionId,
+      requestId,
+      timestamp: Date.now(),
+      entry,
+      isNew: newEntryIds.has(entry.id),
+    });
+  }
+}
+
+// ─── Confirm-mode helper ───────────────────────────────────────────────────────
+
+async function filterWithConfirmMode(
+  entities: DetectedEntity[],
+  sessionId: string,
+  requestId: string,
+  originalText: string,
+  warnThreshold: number,
+  redactThreshold: number,
+): Promise<DetectedEntity[]> {
+  const borderline = entities.filter(
+    e => e.confidence >= warnThreshold && e.confidence < redactThreshold,
+  );
+
+  if (borderline.length === 0) return entities;
+
+  const pendingId = randomUUID();
+  const event = {
+    pendingId,
+    sessionId,
+    requestId,
+    timestamp: Date.now(),
+    entities: borderline,
+    originalText,
+  };
+
+  gsEvents.emit(GS_EVENTS.PENDING_REVIEW_CREATED, event);
+
+  const decisions = await createPendingReview(event, 60_000);
+
+  // Remove rejected entities from the list
+  return entities.filter(e => {
+    if (borderline.some(b => b.original === e.original)) {
+      return decisions[e.original] !== 'reject';
+    }
+    return true;
+  });
+}
+
 // ─── Core request handler ──────────────────────────────────────────────────────
 
 export async function createProxyServer() {
   const appConfig = loadConfig();
-  const protectionConfig = toProtectionConfig(appConfig);
   const { port, anthropic_base_url, openai_base_url } = appConfig.proxy;
+
+  setDefaultTimeout(appConfig.session.timeout_ms);
 
   const ANTHROPIC_URL = anthropic_base_url ?? 'https://api.anthropic.com';
   const OPENAI_URL = openai_base_url ?? 'https://api.openai.com';
@@ -252,6 +306,9 @@ export async function createProxyServer() {
       return;
     }
 
+    const requestId = randomUUID();
+    const requestStart = Date.now();
+
     try {
       const rawBody = await readBody(req);
       let reqBody: Record<string, unknown>;
@@ -263,51 +320,108 @@ export async function createProxyServer() {
         return;
       }
 
-      // Resolve or create session — clients can pass a header for multi-turn continuity
+      // Re-read config so dashboard edits take effect without restart
+      const cfg = loadConfig();
+      const protectionConfig = toProtectionConfig(cfg);
+
       const sessionId = req.headers['x-guiltyspark-session-id'] as string | undefined;
-      const session = getOrCreateSession(sessionId, appConfig.session.timeout_ms);
+      const session = getOrCreateSession(sessionId, cfg.session.timeout_ms);
 
       // ── Sanitize request ──────────────────────────────────────────────────
 
       let sanitizedBody: Record<string, unknown>;
+      let allOriginalText = '';
+      let allSanitizedText = '';
+      let totalEntities = 0;
 
       if (isOpenAI) {
         const spans = extractOpenAITexts(reqBody);
         const substituted = new Map<number, string>();
         for (const { text, index } of spans) {
-          const scanResult = await scanText([text], protectionConfig, appConfig.ollama);
-          substituted.set(index, applySubstitutions(
-            text,
-            scanResult.entities,
-            session,
-            protectionConfig.substitutionMode,
-            protectionConfig.customEntities,
-          ));
+          const scanResult = await scanText([text], protectionConfig, cfg.ollama);
+          const beforeSize = session.entries.size;
+
+          let entities = scanResult.entities;
+          if (cfg.confirm_mode) {
+            entities = await filterWithConfirmMode(
+              entities, session.sessionId, requestId, text,
+              cfg.warn_threshold, cfg.redact_threshold,
+            );
+          }
+
+          const sanitized = applySubstitutions(
+            text, entities, session,
+            protectionConfig.substitutionMode, protectionConfig.customEntities,
+          );
+
+          emitEntityEvents(entities, session.sessionId, requestId, session, beforeSize);
+          substituted.set(index, sanitized);
+          allOriginalText += text + '\n';
+          allSanitizedText += sanitized + '\n';
+          totalEntities += entities.length;
         }
         sanitizedBody = substituteOpenAIBody(reqBody, substituted);
       } else {
-        // Anthropic
         const spans = extractAnthropicTexts(reqBody);
         const substituted = new Map<string, string>();
         for (const { text, key } of spans) {
-          const scanResult = await scanText([text], protectionConfig, appConfig.ollama);
-          substituted.set(key, applySubstitutions(
-            text,
-            scanResult.entities,
-            session,
-            protectionConfig.substitutionMode,
-            protectionConfig.customEntities,
-          ));
+          const scanResult = await scanText([text], protectionConfig, cfg.ollama);
+          const beforeSize = session.entries.size;
+
+          let entities = scanResult.entities;
+          if (cfg.confirm_mode) {
+            entities = await filterWithConfirmMode(
+              entities, session.sessionId, requestId, text,
+              cfg.warn_threshold, cfg.redact_threshold,
+            );
+          }
+
+          const sanitized = applySubstitutions(
+            text, entities, session,
+            protectionConfig.substitutionMode, protectionConfig.customEntities,
+          );
+
+          emitEntityEvents(entities, session.sessionId, requestId, session, beforeSize);
+          substituted.set(key, sanitized);
+          allOriginalText += text + '\n';
+          allSanitizedText += sanitized + '\n';
+          totalEntities += entities.length;
         }
         sanitizedBody = substituteAnthropicBody(reqBody, substituted);
       }
+
+      const sanitizeDurationMs = Date.now() - requestStart;
+
+      gsEvents.emit(GS_EVENTS.REQUEST_PROCESSED, {
+        sessionId: session.sessionId,
+        requestId,
+        timestamp: Date.now(),
+        originalText: allOriginalText.trim(),
+        sanitizedText: allSanitizedText.trim(),
+        entitiesFound: totalEntities,
+        durationMs: sanitizeDurationMs,
+        provider: isOpenAI ? 'openai' : 'anthropic',
+      });
+
+      // Add initial audit entry (will be updated with response)
+      const auditId = randomUUID();
+      addAuditEntry({
+        id: auditId,
+        sessionId: session.sessionId,
+        requestId,
+        timestamp: requestStart,
+        originalText: allOriginalText.trim(),
+        sanitizedText: allSanitizedText.trim(),
+        entitiesFound: totalEntities,
+        provider: isOpenAI ? 'openai' : 'anthropic',
+        durationMs: sanitizeDurationMs,
+      });
 
       // ── Forward sanitized request ─────────────────────────────────────────
 
       const targetBase = isOpenAI ? OPENAI_URL : ANTHROPIC_URL;
       const targetUrl = `${targetBase}${url}`;
 
-      // Pass through auth headers from the original request
       const forwardHeaders: Record<string, string> = {};
       for (const [key, value] of Object.entries(req.headers)) {
         if (typeof value === 'string' && (
@@ -321,15 +435,14 @@ export async function createProxyServer() {
       }
 
       const upstream = await forwardRequest(
-        targetUrl,
-        'POST',
-        forwardHeaders,
-        JSON.stringify(sanitizedBody),
+        targetUrl, 'POST', forwardHeaders, JSON.stringify(sanitizedBody),
       );
 
       // ── Decode response ───────────────────────────────────────────────────
 
       let finalBody = upstream.body;
+      let llmResponseText = '';
+      let decodedResponseText = '';
 
       if (upstream.status === 200) {
         try {
@@ -341,19 +454,39 @@ export async function createProxyServer() {
             rawText = extractOpenAIResponseText(respJson);
             const decoded = decodeResponse(rawText, session);
             patchedJson = patchOpenAIResponseText(respJson, decoded);
+            llmResponseText = rawText;
+            decodedResponseText = decoded;
           } else {
             rawText = extractAnthropicResponseText(respJson);
             const decoded = decodeResponse(rawText, session);
             patchedJson = patchAnthropicResponseText(respJson, decoded);
+            llmResponseText = rawText;
+            decodedResponseText = decoded;
           }
 
           finalBody = JSON.stringify(patchedJson);
+
+          gsEvents.emit(GS_EVENTS.RESPONSE_DECODED, {
+            sessionId: session.sessionId,
+            requestId,
+            timestamp: Date.now(),
+            llmResponse: llmResponseText,
+            decodedResponse: decodedResponseText,
+          });
+
+          // Update audit entry with response data
+          const { updateAuditEntry } = await import('./audit-log.js');
+          updateAuditEntry(auditId, {
+            llmResponse: llmResponseText,
+            decodedResponse: decodedResponseText,
+            durationMs: Date.now() - requestStart,
+          });
+
         } catch {
           // If response parsing fails, pass through unmodified
         }
       }
 
-      // Return session ID header so clients can maintain multi-turn sessions
       res.writeHead(upstream.status, {
         'Content-Type': 'application/json',
         'X-GuiltySpark-Session-Id': session.sessionId,

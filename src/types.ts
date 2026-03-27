@@ -108,6 +108,11 @@ export interface ProxyConfig {
   openai_base_url?: string;
 }
 
+export interface DashboardConfig {
+  port: number;
+  enabled: boolean;
+}
+
 export interface AppConfig {
   ollama: OllamaConfig;
   protect: EntityType[];
@@ -118,6 +123,13 @@ export interface AppConfig {
   passthrough_if_local: boolean;
   session: SessionConfig;
   proxy: ProxyConfig;
+  dashboard: DashboardConfig;
+  /** Hold borderline detections for manual review in the dashboard before forwarding. */
+  confirm_mode: boolean;
+  /** Entities with confidence >= warn_threshold but < redact_threshold trigger a warning or review. */
+  warn_threshold: number;
+  /** Entities with confidence >= redact_threshold are automatically redacted. */
+  redact_threshold: number;
 }
 
 // Forward declaration — SubstitutionMap is defined in substitution-map.ts

@@ -20,30 +20,13 @@ import {
 import { z } from 'zod';
 
 import { loadConfig, toProtectionConfig } from './config.js';
-import { createSubstitutionMap } from './substitution-map.js';
 import { scanText } from './pii-scanner.js';
 import { applySubstitutions } from './substitution-engine.js';
 import { decodeResponse } from './response-decoder.js';
 import { relayToLLM } from './llm-relay.js';
-import type { SubstitutionMap } from './types.js';
-
-// ─── Session registry ──────────────────────────────────────────────────────────
-
-const sessions = new Map<string, SubstitutionMap>();
-
-function getOrCreateSession(sessionId?: string): SubstitutionMap {
-  if (sessionId && sessions.has(sessionId)) {
-    return sessions.get(sessionId)!;
-  }
-  const map = createSubstitutionMap(sessionId);
-  sessions.set(map.sessionId, map);
-
-  // Auto-expire sessions after 1 hour
-  const config = loadConfig();
-  setTimeout(() => sessions.delete(map.sessionId), config.session.timeout_ms);
-
-  return map;
-}
+import { getOrCreateSession, sessions } from './session-registry.js';
+import { gsEvents, GS_EVENTS } from './events.js';
+import { randomUUID } from 'crypto';
 
 // ─── Tool schemas ──────────────────────────────────────────────────────────────
 
@@ -146,10 +129,24 @@ export function createServer(): Server {
       switch (name) {
         case 'sanitize_prompt': {
           const input = SanitizePromptSchema.parse(args);
+          const requestId = randomUUID();
           const session = getOrCreateSession(input.session_id);
 
           const scanResult = await scanText([input.text], protectionConfig, appConfig.ollama);
           const sanitized = applySubstitutions(input.text, scanResult.entities, session, protectionConfig.substitutionMode, protectionConfig.customEntities);
+
+          // Emit pipeline events
+          for (const entity of scanResult.entities) {
+            gsEvents.emit(GS_EVENTS.ENTITY_DETECTED, {
+              sessionId: session.sessionId, requestId, timestamp: Date.now(), entity,
+            });
+          }
+          gsEvents.emit(GS_EVENTS.REQUEST_PROCESSED, {
+            sessionId: session.sessionId, requestId, timestamp: Date.now(),
+            originalText: input.text, sanitizedText: sanitized,
+            entitiesFound: scanResult.entities.length, durationMs: scanResult.durationMs,
+            provider: 'mcp',
+          });
 
           return {
             content: [{
@@ -184,6 +181,12 @@ export function createServer(): Server {
           }
 
           const decoded = decodeResponse(input.text, session);
+
+          gsEvents.emit(GS_EVENTS.RESPONSE_DECODED, {
+            sessionId: input.session_id, requestId: randomUUID(), timestamp: Date.now(),
+            llmResponse: input.text, decodedResponse: decoded,
+          });
+
           return {
             content: [{
               type: 'text',
@@ -194,15 +197,33 @@ export function createServer(): Server {
 
         case 'relay_prompt': {
           const input = RelayPromptSchema.parse(args);
+          const requestId = randomUUID();
           const session = getOrCreateSession(input.session_id);
 
           // Sanitize all message content
           const sanitizedMessages = [];
+          let allOriginalText = '';
+          let allSanitizedText = '';
+          let totalEntities = 0;
           for (const msg of input.messages) {
             const scanResult = await scanText([msg.content], protectionConfig, appConfig.ollama);
             const sanitizedContent = applySubstitutions(msg.content, scanResult.entities, session, protectionConfig.substitutionMode, protectionConfig.customEntities);
             sanitizedMessages.push({ ...msg, content: sanitizedContent });
+            for (const entity of scanResult.entities) {
+              gsEvents.emit(GS_EVENTS.ENTITY_DETECTED, {
+                sessionId: session.sessionId, requestId, timestamp: Date.now(), entity,
+              });
+            }
+            allOriginalText += msg.content + '\n';
+            allSanitizedText += sanitizedContent + '\n';
+            totalEntities += scanResult.entities.length;
           }
+
+          gsEvents.emit(GS_EVENTS.REQUEST_PROCESSED, {
+            sessionId: session.sessionId, requestId, timestamp: Date.now(),
+            originalText: allOriginalText.trim(), sanitizedText: allSanitizedText.trim(),
+            entitiesFound: totalEntities, durationMs: 0, provider: input.provider,
+          });
 
           // Relay to LLM
           const llmResponse = await relayToLLM({
@@ -216,6 +237,11 @@ export function createServer(): Server {
 
           // Decode response
           const decodedContent = decodeResponse(llmResponse.content, session);
+
+          gsEvents.emit(GS_EVENTS.RESPONSE_DECODED, {
+            sessionId: session.sessionId, requestId, timestamp: Date.now(),
+            llmResponse: llmResponse.content, decodedResponse: decodedContent,
+          });
 
           return {
             content: [{

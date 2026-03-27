@@ -1,4 +1,4 @@
-import { readFileSync, existsSync } from 'fs';
+import { readFileSync, writeFileSync, existsSync } from 'fs';
 import { join } from 'path';
 import yaml from 'js-yaml';
 import type { AppConfig, EntityType, ProtectionConfig } from './types.js';
@@ -26,6 +26,13 @@ const DEFAULT_CONFIG: AppConfig = {
   proxy: {
     port: 8787,
   },
+  dashboard: {
+    port: 8788,
+    enabled: true,
+  },
+  confirm_mode: false,
+  warn_threshold: 0.6,
+  redact_threshold: 0.8,
 };
 
 let cachedConfig: AppConfig | null = null;
@@ -66,6 +73,20 @@ export function toProtectionConfig(appConfig: AppConfig): ProtectionConfig {
     nerConfidenceThreshold: appConfig.ollama.ner_confidence_threshold,
     substitutionMode: appConfig.substitution_mode,
   };
+}
+
+let configFilePath = './guiltyspark.config.yaml';
+
+export function saveConfig(config: AppConfig, filePath?: string): void {
+  const target = filePath ?? configFilePath;
+  const yamlStr = yaml.dump(config, { lineWidth: 120 });
+  writeFileSync(target, yamlStr, 'utf-8');
+  configFilePath = target;
+  cachedConfig = config;
+}
+
+export function invalidateConfigCache(): void {
+  cachedConfig = null;
 }
 
 function deepMerge<T extends object>(base: T, override: Partial<T>): T {
