@@ -149,7 +149,7 @@ export function createServer(): Server {
           const session = getOrCreateSession(input.session_id);
 
           const scanResult = await scanText([input.text], protectionConfig, appConfig.ollama);
-          const sanitized = applySubstitutions(input.text, scanResult.entities, session);
+          const sanitized = applySubstitutions(input.text, scanResult.entities, session, protectionConfig.substitutionMode, protectionConfig.customEntities);
 
           return {
             content: [{
@@ -200,7 +200,7 @@ export function createServer(): Server {
           const sanitizedMessages = [];
           for (const msg of input.messages) {
             const scanResult = await scanText([msg.content], protectionConfig, appConfig.ollama);
-            const sanitizedContent = applySubstitutions(msg.content, scanResult.entities, session);
+            const sanitizedContent = applySubstitutions(msg.content, scanResult.entities, session, protectionConfig.substitutionMode, protectionConfig.customEntities);
             sanitizedMessages.push({ ...msg, content: sanitizedContent });
           }
 

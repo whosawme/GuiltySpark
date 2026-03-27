@@ -9,7 +9,9 @@ const fullConfig: ProtectionConfig = {
   ],
   allow: [],
   customPatterns: [],
+  customEntities: [],
   nerConfidenceThreshold: 0.6,
+  substitutionMode: 'realistic',
 };
 
 describe('regexScan', () => {
@@ -63,7 +65,7 @@ describe('regexScan', () => {
     expect(entities.some(e => e.type === 'PHONE')).toBe(true);
   });
 
-  test('detects custom patterns', () => {
+  test('detects legacy custom patterns and sets customLabel', () => {
     const customConfig: ProtectionConfig = {
       ...fullConfig,
       customPatterns: [{ pattern: 'Project (Nightingale|Falcon)', label: 'CODENAME' }],
@@ -72,6 +74,55 @@ describe('regexScan', () => {
     const custom = entities.filter(e => e.type === 'CUSTOM');
     expect(custom).toHaveLength(1);
     expect(custom[0].original).toBe('Project Nightingale');
+    expect(custom[0].customLabel).toBe('CODENAME');
+  });
+
+  test('detects user-nominated custom entity patterns', () => {
+    const customConfig: ProtectionConfig = {
+      ...fullConfig,
+      customEntities: [{
+        name: 'Employee ID',
+        label: 'EMPLOYEE_ID',
+        patterns: ['\\bEMP-\\d{5}\\b'],
+      }],
+    };
+    const entities = regexScan('Employee EMP-00123 submitted the request.', customConfig);
+    const custom = entities.filter(e => e.type === 'CUSTOM');
+    expect(custom).toHaveLength(1);
+    expect(custom[0].original).toBe('EMP-00123');
+    expect(custom[0].customLabel).toBe('EMPLOYEE_ID');
+  });
+
+  test('multiple custom entity types are detected independently', () => {
+    const customConfig: ProtectionConfig = {
+      ...fullConfig,
+      customEntities: [
+        { name: 'Employee ID', label: 'EMPLOYEE_ID', patterns: ['\\bEMP-\\d{5}\\b'] },
+        { name: 'Project Codename', label: 'CODENAME', patterns: ['Project (Alpha|Beta|Gamma)'] },
+      ],
+    };
+    const text = 'EMP-00123 is assigned to Project Alpha.';
+    const entities = regexScan(text, customConfig);
+    const emp = entities.find(e => e.customLabel === 'EMPLOYEE_ID');
+    const code = entities.find(e => e.customLabel === 'CODENAME');
+    expect(emp).toBeDefined();
+    expect(code).toBeDefined();
+    expect(emp!.original).toBe('EMP-00123');
+    expect(code!.original).toBe('Project Alpha');
+  });
+
+  test('skips custom entities with invalid regex gracefully', () => {
+    const customConfig: ProtectionConfig = {
+      ...fullConfig,
+      customEntities: [
+        { name: 'Bad Pattern', label: 'BAD', patterns: ['[invalid(regex'] },
+        { name: 'Good Pattern', label: 'GOOD', patterns: ['\\bGOOD-\\d+\\b'] },
+      ],
+    };
+    // Should not throw; the invalid pattern is skipped
+    const entities = regexScan('Ref: GOOD-42 here.', customConfig);
+    const good = entities.filter(e => e.customLabel === 'GOOD');
+    expect(good).toHaveLength(1);
   });
 
   test('returns empty array for clean text', () => {

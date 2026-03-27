@@ -1,16 +1,38 @@
 /**
- * Substitution Engine — generates realistic synthetic PII replacements.
+ * Substitution Engine — generates synthetic PII replacements in two modes.
  *
- * Design decisions:
- * - Deterministic per session: a seed derived from the session ID ensures the
- *   same original always maps to the same synthetic within a session.
- * - Type-aware: each entity type has its own generator to preserve format and
- *   plausibility (a name stays a name, a phone number stays a phone number).
- * - No external faker library dependency: we use lightweight inline generators
- *   to keep the install footprint small and avoid supply-chain risk.
+ * SUBSTITUTION MODES:
+ *
+ *   "realistic" (default)
+ *     Replaces PII with realistic-looking synthetic values that preserve format
+ *     and plausibility. "John Smith" → "Marcus Chen", "(555) 123-4567" →
+ *     "(412) 876-2391". This mode preserves LLM reasoning quality because
+ *     the synthetic data looks like real data — the model treats it naturally.
+ *
+ *   "obvious"
+ *     Replaces PII with bracketed placeholder labels: "John Smith" → "[PERSON_NAME_0]",
+ *     "(555) 123-4567" → "[PHONE_0]". Useful for auditing what gets redacted,
+ *     debugging rules, or when users prefer explicit redaction markers.
+ *     Custom entity types get their own label: "EMP-00123" → "[EMPLOYEE_ID_0]".
+ *
+ * CONSISTENCY GUARANTEE (both modes):
+ *   The same original value always produces the same synthetic within a session.
+ *   - Realistic: seeded PRNG (xorshift32) keyed on (sessionId + original)
+ *   - Obvious: counter-based IDs keyed per type, stored in the SubstitutionMap
+ *
+ * CUSTOM ENTITY SUPPORT:
+ *   User-defined entities (from config.custom_entities) carry a `customLabel`
+ *   field on DetectedEntity. The engine uses that label for placeholder names in
+ *   obvious mode and for selecting the right generator in realistic mode
+ *   (via the entity's `replacement_type`, if configured).
+ *
+ * DESIGN NOTES:
+ * - Deterministic per session: seeded PRNG ensures same original → same synthetic
+ * - Type-aware: each built-in type has its own generator
+ * - No external faker dependency: lightweight inline generators keep attack surface small
  */
 
-import type { DetectedEntity, EntityType, SubstitutionMap } from './types.js';
+import type { CustomEntityDefinition, DetectedEntity, EntityType, SubstitutionMap, SubstitutionMode } from './types.js';
 import { insertEntry, lookupOriginal } from './substitution-map.js';
 
 // ─── Seeded PRNG (xorshift32) ──────────────────────────────────────────────────
@@ -171,29 +193,69 @@ function generateFinancialAccount(rng: Rng): string {
 
 // ─── Dispatcher ───────────────────────────────────────────────────────────────
 
-function generateSynthetic(type: EntityType, original: string, sessionId: string): string {
-  // Seed the RNG from (sessionId + original) so the same original always
-  // produces the same synthetic within a session, but different sessions
-  // produce different synthetics for the same original.
+/**
+ * Generate a synthetic value for an entity in "realistic" mode.
+ *
+ * Seeded from (sessionId + original) so the same original always yields the same
+ * synthetic within a session, but across sessions it's different (cross-session
+ * correlation is prevented).
+ *
+ * For custom entities with a `replacement_type`, delegates to that type's generator.
+ * For custom entities without a `replacement_type`, falls through to obvious-style
+ * bracketed placeholders since there's no suitable realistic generator to choose from.
+ */
+function generateRealistic(
+  type: EntityType,
+  original: string,
+  sessionId: string,
+  customLabel?: string,
+  replacementType?: EntityType,
+): string {
+  const effectiveType = replacementType ?? type;
   const seed = seedFromString(sessionId + ':' + original);
   const rng = makeSeededRng(seed);
 
-  switch (type) {
-    case 'PERSON_NAME':     return generatePersonName(rng);
-    case 'EMAIL':           return generateEmail(rng);
-    case 'PHONE':           return generatePhone(rng);
-    case 'SSN':             return generateSSN(rng);
-    case 'CREDIT_CARD':     return generateCreditCard(rng);
-    case 'IP_ADDRESS':      return generateIPAddress(rng);
-    case 'API_KEY':         return generateAPIKey(rng);
-    case 'ADDRESS':         return generateAddress(rng);
-    case 'DATE_OF_BIRTH':   return generateDOB(rng);
-    case 'COMPANY_INTERNAL':return generateCompanyName(rng);
+  switch (effectiveType) {
+    case 'PERSON_NAME':       return generatePersonName(rng);
+    case 'EMAIL':             return generateEmail(rng);
+    case 'PHONE':             return generatePhone(rng);
+    case 'SSN':               return generateSSN(rng);
+    case 'CREDIT_CARD':       return generateCreditCard(rng);
+    case 'IP_ADDRESS':        return generateIPAddress(rng);
+    case 'API_KEY':           return generateAPIKey(rng);
+    case 'ADDRESS':           return generateAddress(rng);
+    case 'DATE_OF_BIRTH':     return generateDOB(rng);
+    case 'COMPANY_INTERNAL':  return generateCompanyName(rng);
     case 'FINANCIAL_ACCOUNT': return generateFinancialAccount(rng);
-    case 'MEDICAL_INFO':    return '[MEDICAL_INFO]'; // No realistic substitute
-    case 'CUSTOM':          return `[CUSTOM_${Math.floor(rng() * 9999)}]`;
-    default:                return `[REDACTED_${type}]`;
+    // MEDICAL_INFO and bare CUSTOM have no plausible realistic substitute —
+    // fall through to obvious brackets rather than making something up.
+    case 'MEDICAL_INFO':
+    case 'CUSTOM':
+    default: {
+      // Use customLabel if available for a more informative placeholder
+      const label = customLabel ?? effectiveType;
+      return `[${label}]`;
+    }
   }
+}
+
+/**
+ * Generate a synthetic value for an entity in "obvious" mode.
+ *
+ * Produces bracketed placeholders using a session-scoped counter. The counter
+ * is NOT looked up here — it is determined by `insertEntry` when the entry is
+ * first recorded in the SubstitutionMap. We use the pre-computed counter key
+ * and count here only when generating the placeholder before insertion.
+ *
+ * Format: [TYPE_N] for built-in types, [CUSTOM_LABEL_N] for user-defined types.
+ */
+function generateObvious(
+  type: EntityType,
+  customLabel: string | undefined,
+  count: number,
+): string {
+  const label = customLabel ?? type;
+  return `[${label}_${count}]`;
 }
 
 // ─── Public API ────────────────────────────────────────────────────────────────
@@ -201,13 +263,23 @@ function generateSynthetic(type: EntityType, original: string, sessionId: string
 /**
  * Apply substitutions to a text string, updating the session map with any new entries.
  * Returns the transformed text.
+ *
+ * @param mode - "realistic" (default) or "obvious". Pass from ProtectionConfig.
+ * @param customEntityDefs - User-defined entity definitions for looking up replacement_type.
  */
 export function applySubstitutions(
   text: string,
   entities: DetectedEntity[],
   sessionMap: SubstitutionMap,
+  mode: SubstitutionMode = 'realistic',
+  customEntityDefs: CustomEntityDefinition[] = [],
 ): string {
   if (entities.length === 0) return text;
+
+  // Build a label → definition lookup for replacement_type resolution
+  const defsByLabel = new Map<string, CustomEntityDefinition>(
+    customEntityDefs.map(d => [d.label, d]),
+  );
 
   // Sort entities by start position descending so we can splice from the end
   // without invalidating earlier offsets
@@ -216,10 +288,30 @@ export function applySubstitutions(
   let result = text;
   for (const entity of sorted) {
     const existing = lookupOriginal(sessionMap, entity.original);
-    const synthetic = existing?.synthetic ?? generateSynthetic(entity.type, entity.original, sessionMap.sessionId);
+    let synthetic: string;
 
-    if (!existing) {
-      insertEntry(sessionMap, entity.original, synthetic, entity.type);
+    if (existing) {
+      synthetic = existing.synthetic;
+    } else {
+      const def = entity.customLabel ? defsByLabel.get(entity.customLabel) : undefined;
+      const replacementType = def?.replacement_type;
+
+      if (mode === 'obvious') {
+        // Pre-compute what counter value will be used so we can build the label.
+        // The counter is incremented inside insertEntry, so peek at current value.
+        const counterKey = entity.customLabel ?? entity.type;
+        const count = sessionMap.counters.get(counterKey) ?? 0;
+        synthetic = generateObvious(entity.type, entity.customLabel, count);
+      } else {
+        synthetic = generateRealistic(
+          entity.type,
+          entity.original,
+          sessionMap.sessionId,
+          entity.customLabel,
+          replacementType,
+        );
+      }
+      insertEntry(sessionMap, entity.original, synthetic, entity.type, entity.customLabel);
     }
 
     // Replace this occurrence by position (preserves multi-occurrence consistency)
@@ -237,11 +329,21 @@ export function getOrCreateSynthetic(
   original: string,
   type: EntityType,
   sessionMap: SubstitutionMap,
+  mode: SubstitutionMode = 'realistic',
+  customLabel?: string,
+  replacementType?: EntityType,
 ): string {
   const existing = lookupOriginal(sessionMap, original);
   if (existing) return existing.synthetic;
 
-  const synthetic = generateSynthetic(type, original, sessionMap.sessionId);
-  insertEntry(sessionMap, original, synthetic, type);
+  let synthetic: string;
+  if (mode === 'obvious') {
+    const counterKey = customLabel ?? type;
+    const count = sessionMap.counters.get(counterKey) ?? 0;
+    synthetic = generateObvious(type, customLabel, count);
+  } else {
+    synthetic = generateRealistic(type, original, sessionMap.sessionId, customLabel, replacementType);
+  }
+  insertEntry(sessionMap, original, synthetic, type, customLabel);
   return synthetic;
 }

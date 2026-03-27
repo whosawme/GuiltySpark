@@ -100,7 +100,7 @@ export function regexScan(text: string, config: ProtectionConfig): DetectedEntit
     }
   }
 
-  // Run user-defined custom patterns
+  // Legacy simple custom patterns (kept for backward compatibility)
   for (const custom of config.customPatterns) {
     const pat = new RegExp(custom.pattern, 'g');
     let match: RegExpExecArray | null;
@@ -113,7 +113,37 @@ export function regexScan(text: string, config: ProtectionConfig): DetectedEntit
         start: match.index,
         end: match.index + original.length,
         source: 'regex',
+        customLabel: custom.label,
       });
+    }
+  }
+
+  // User-nominated custom entity types — richer definitions with per-entity labels.
+  // Each CustomEntityDefinition can supply multiple regex patterns. Matches are
+  // tagged with the user's label so the substitution engine can produce properly
+  // named placeholders (e.g. [EMPLOYEE_ID_0] not [CUSTOM_0]).
+  for (const def of config.customEntities) {
+    for (const pattern of def.patterns ?? []) {
+      let pat: RegExp;
+      try {
+        pat = new RegExp(pattern, 'g');
+      } catch {
+        console.warn(`[pii-scanner] Invalid regex in custom entity "${def.name}": ${pattern}`);
+        continue;
+      }
+      let match: RegExpExecArray | null;
+      while ((match = pat.exec(text)) !== null) {
+        const original = match[0];
+        entities.push({
+          original,
+          type: 'CUSTOM',
+          confidence: 0.92,
+          start: match.index,
+          end: match.index + original.length,
+          source: 'regex',
+          customLabel: def.label,
+        });
+      }
     }
   }
 
@@ -122,13 +152,15 @@ export function regexScan(text: string, config: ProtectionConfig): DetectedEntit
 
 // ─── Stage 2: Ollama NER scan ──────────────────────────────────────────────────
 
-const NER_PROMPT = `You are a Named Entity Recognition system. Extract all sensitive personally identifiable information (PII) from the following text.
+const NER_PROMPT_BASE = `You are a Named Entity Recognition system. Extract all sensitive personally identifiable information (PII) from the following text.
 
 For each entity found, output a JSON object with these fields:
 - "text": the exact matched string as it appears in the source (do not modify)
-- "type": one of: PERSON_NAME, EMAIL, PHONE, ADDRESS, SSN, CREDIT_CARD, API_KEY, IP_ADDRESS, DATE_OF_BIRTH, COMPANY_INTERNAL, FINANCIAL_ACCOUNT, MEDICAL_INFO
+- "type": one of the built-in types or a custom type listed below
 - "confidence": a float from 0.0 to 1.0 representing your certainty
 
+Built-in types: PERSON_NAME, EMAIL, PHONE, ADDRESS, SSN, CREDIT_CARD, API_KEY, IP_ADDRESS, DATE_OF_BIRTH, COMPANY_INTERNAL, FINANCIAL_ACCOUNT, MEDICAL_INFO
+{CUSTOM_ENTITY_SECTION}
 Only include entities you are genuinely confident about. If there is no PII, return an empty array [].
 Output ONLY a valid JSON array, no other text.
 
@@ -136,6 +168,29 @@ Text:
 """
 {TEXT}
 """`;
+
+/**
+ * Build the custom entity section injected into the NER prompt.
+ *
+ * For each user-defined entity, we inject the name, label, description, and
+ * example values so Ollama can recognize them contextually — not just by regex.
+ * This is the key advantage of the two-stage approach: regex catches structured
+ * patterns, but Ollama catches entities that require semantic understanding.
+ */
+function buildCustomEntitySection(customEntities: ProtectionConfig['customEntities']): string {
+  if (customEntities.length === 0) return '';
+
+  const lines = ['\nAdditional custom entity types to detect:'];
+  for (const def of customEntities) {
+    lines.push(`- Type: "${def.label}" — ${def.name}`);
+    if (def.description) lines.push(`  Description: ${def.description}`);
+    if (def.examples && def.examples.length > 0) {
+      lines.push(`  Examples: ${def.examples.map(e => `"${e}"`).join(', ')}`);
+    }
+  }
+  lines.push('');
+  return lines.join('\n');
+}
 
 interface OllamaEntity {
   text: string;
@@ -150,8 +205,15 @@ export async function ollamaScan(
 ): Promise<DetectedEntity[]> {
   const ollama = new Ollama({ host: ollamaConfig.baseUrl });
   const protected_ = new Set(config.protect);
+  // Build the set of valid custom labels so we can accept them from Ollama's response
+  const customLabelMap = new Map<string, ProtectionConfig['customEntities'][number]>(
+    config.customEntities.map(def => [def.label, def]),
+  );
 
-  const prompt = NER_PROMPT.replace('{TEXT}', text);
+  const customSection = buildCustomEntitySection(config.customEntities);
+  const prompt = NER_PROMPT_BASE
+    .replace('{CUSTOM_ENTITY_SECTION}', customSection)
+    .replace('{TEXT}', text);
 
   let rawResponse: string;
   try {
@@ -189,8 +251,12 @@ export async function ollamaScan(
     if (!item.text || !item.type || typeof item.confidence !== 'number') continue;
     if (item.confidence < config.nerConfidenceThreshold) continue;
 
-    const entityType = item.type as EntityType;
-    if (!protected_.has(entityType)) continue;
+    // The model may return either a built-in EntityType or a custom label.
+    // Check custom labels first so user-defined entities get their own label tag.
+    const isCustomLabel = customLabelMap.has(item.type);
+    const entityType: EntityType = isCustomLabel ? 'CUSTOM' : item.type as EntityType;
+
+    if (!isCustomLabel && !protected_.has(entityType)) continue;
 
     // Find the position of this entity in the source text
     const idx = text.indexOf(item.text);
@@ -203,6 +269,7 @@ export async function ollamaScan(
       start: idx,
       end: idx + item.text.length,
       source: 'llm',
+      customLabel: isCustomLabel ? item.type : undefined,
     });
   }
 

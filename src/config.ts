@@ -16,10 +16,15 @@ const DEFAULT_CONFIG: AppConfig = {
   ] as EntityType[],
   allow: [],
   custom_patterns: [],
+  custom_entities: [],
+  substitution_mode: 'realistic',
   passthrough_if_local: false,
   session: {
     timeout_ms: 3_600_000,
     max_entries: 10_000,
+  },
+  proxy: {
+    port: 8787,
   },
 };
 
@@ -57,7 +62,9 @@ export function toProtectionConfig(appConfig: AppConfig): ProtectionConfig {
     protect: appConfig.protect,
     allow: appConfig.allow,
     customPatterns: appConfig.custom_patterns,
+    customEntities: appConfig.custom_entities,
     nerConfidenceThreshold: appConfig.ollama.ner_confidence_threshold,
+    substitutionMode: appConfig.substitution_mode,
   };
 }
 
