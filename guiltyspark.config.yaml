@@ -1,0 +1,35 @@
+# GuiltySpark Configuration
+# Controls which PII categories are detected and replaced
+
+ollama:
+  baseUrl: "http://localhost:11434"
+  model: "llama3.2"          # Model to use for NER
+  timeout: 30000              # ms
+  ner_confidence_threshold: 0.6
+
+protect:
+  - PERSON_NAME
+  - EMAIL
+  - PHONE
+  - SSN
+  - CREDIT_CARD
+  - API_KEY
+  - IP_ADDRESS
+  - DATE_OF_BIRTH
+  - ADDRESS
+  - FINANCIAL_ACCOUNT
+
+allow: []
+  # - COMPANY_NAME  # uncomment to allow company names through
+
+custom_patterns:
+  # - pattern: "Project (Nightingale|Falcon|Atlas)"
+  #   label: CODENAME
+  # - pattern: "\\b10\\.0\\.\\d+\\.\\d+\\b"
+  #   label: INTERNAL_IP
+
+passthrough_if_local: false   # set true to skip sanitization for local LLMs
+
+session:
+  timeout_ms: 3600000         # 1 hour
+  max_entries: 10000          # max substitution map entries per session
