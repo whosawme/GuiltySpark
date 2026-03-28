@@ -1,6 +1,6 @@
 # GuiltySpark
 
-> *"I am a genius."* — 343 Guilty Spark, faithfully indexing everything it was told to protect.
+> * — 343 Guilty Spark, faithfully indexing everything it was told to protect.
 
 GuiltySpark is a local privacy layer that sits between you and LLM providers (Anthropic, OpenAI, etc.). It intercepts your prompts, detects and replaces sensitive data with realistic-looking synthetic substitutes before the request leaves your machine, sends the sanitized prompt to the LLM, then decodes the response back — restoring all substituted values before returning the result to you.
 
