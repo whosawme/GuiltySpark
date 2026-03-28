@@ -31,11 +31,7 @@ npm run dev:dashboard
 
 **Live Monitor**
 
-![Live Monitor](docs/dashboard-monitor.jpg)
-
-**Configuration**
-
-![Configuration](docs/dashboard-config.jpg)
+![Live Monitor](docs/dashboard-monitor.png)
 
 > To view the dashboard, run `npm run dev:dashboard` and open [http://localhost:8788](http://localhost:8788).
 
