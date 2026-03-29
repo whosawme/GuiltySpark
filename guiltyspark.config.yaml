@@ -3,7 +3,7 @@
 
 ollama:
   baseUrl: "http://localhost:11434"
-  model: "llama3.2"          # Model to use for NER
+  model: "gemma3:4b"          # Model to use for NER
   timeout: 30000              # ms
   ner_confidence_threshold: 0.6
 

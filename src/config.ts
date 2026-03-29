@@ -6,7 +6,7 @@ import type { AppConfig, EntityType, ProtectionConfig } from './types.js';
 const DEFAULT_CONFIG: AppConfig = {
   ollama: {
     baseUrl: 'http://localhost:11434',
-    model: 'llama3.2',
+    model: 'gemma3:4b',
     timeout: 30000,
     ner_confidence_threshold: 0.6,
   },
